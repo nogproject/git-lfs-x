@@ -1,0 +1,1071 @@
+#!/usr/bin/env python3
+
+"""\
+Usage:
+  git-lfs-x init
+  git-lfs-x checkout [--link|--copy|--placeholder] [--] <files>...
+  git-lfs-x link [--keep-placeholders] [--ignore-missing] [--] [<files>...]
+  git-lfs-x fsck [--fix-perms]
+  git-lfs-x gc
+  git-lfs-x add [--link] [--] <files>...
+  git-lfs-x migrate
+  git-lfs-x push --head-all [--skip-placeholders] <remote>
+  git-lfs-x fetch [--link|--copy] [--] <files>...
+  git-lfs-x prune --boundary=<rev> --retain-days=<period> [--dry-run] [-v]
+
+Options:
+  --keep-placeholders   Skip placeholders when linking.
+  --ignore-missing      Ignore missing LFS objects.
+  --fix-perms           Try to fix unexpected permissions.
+  --head-all            Push all LFS content that is used by HEAD.
+  --skip-placeholders   Exclude placeholders from push.
+
+  --link            Checkout hard links (default).
+                    Add files as hard links unless they are executable.
+  --copy            Checkout copies.
+  --placeholder     Checkout placeholders.
+
+`git lfs-x` provides additional Git LFS commands that might later be
+implemented directly in Git LFS.
+
+`git lfs-x init` creates the `.git/lfs/objects` dir.
+
+`git lfs-x checkout` replaces LFS-tracked files in the working copy with hard
+links, copies, or placeholders as specified by the options.
+
+`git lfs-x link` replaces LFS content in the working copy with read-only hard
+links to the git LFS object storage in order to avoid data duplication.  It
+does not use hard links for executables, but copies them instead, to avoid
+surprises: The Git LFS spec
+<https://github.com/git-lfs/git-lfs/blob/master/docs/spec.md> does not mention
+the x-bit.  Git LFS seems to store all content without x-bit in practice.
+
+`git lfs-x link` uses `git update-index --assume-unchanged-once` if available
+to skip re-computing SHAs for hard links that are known to have the correct
+content.  See patch in <https://github.com/sprohaska/git-silo/tree/master/git>.
+It can be much faster to deactivate LFS smudge and use `git lfs-x link`
+instead.  To deactivate Git LFS smudge temporarily, use:
+
+```
+git -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false <git-command>...
+```
+
+The following Git alias is useful; `.gitconfig`:
+
+```
+[alias]
+    nolfs = "!f() { git -c filter.lfs.smudge= -c filter.lfs.process= -c filter.lfs.required=false \"$@\" ; }; f"
+```
+
+```bash
+git nolfs <git-command>....
+```
+
+`git lfs-x link` tries to create hard links to other Git repos for LFS content
+that is not available in the current repo.  It builds a list of candidate repos
+from `.git/objects/info/alternates` and `git config --get-all
+lfs.weakalternate`.
+
+`git lfs-x fsck` reports permission problems for paths below `.git/lfs` for
+shared repos and tries to fix them if `--fix-perms` is specified.  Git LFS
+seems to lack proper support for shared repositories.  See at least issues:
+
+ - <https://github.com/git-lfs/git-lfs/issues/2015>
+ - <https://github.com/git-lfs/git-lfs/issues/943>
+
+As a workaround, regularly run `fsck --fix-perms` on shared repos until
+upstream Git LFS correctly supports shared repo permissions.
+
+`git lfs-x gc` removes temporary files in `.git/lfs`.
+
+`git lfs-x add <files>...` verifies that the chosen files have LFS attributes
+and then runs `git add` for them.  `lfs-x add` does not modify attributes.  It
+is only a safety measure to protect against accidentally adding binary files
+directly to Git.
+
+`<files>...` is interpreted as in `git ls-files <files>...` with the following
+modification: a file is only considered if it is already known to be
+LFS-tracked, that is it is reported by `git lfs ls-files`, or if it is
+completely untracked.  `git lfs-x add` ignores files that are known to be
+tracked as ordinary Git content, so that it is safe to run `git lfs-x add .` in
+order to update all LFS content in the working copy.
+
+`git lfs-x migrate` migrates the working copy from Silo to LFS.
+
+`git lfs-x push --head-all` disables the usual LFS heuristic and instead pushes
+all LFS content that is used by HEAD, which can be useful to ensure that all
+current LFS content is indeed at the remote.  If you do not have all LFS files
+locally, you can use `git lfs-x push --head-all --skip-placeholders` to push
+the files you have.
+
+`git lfs-x fetch <files>...` limits fetch to the specified files.  `fetch`
+automatically calls `checkout` after a successful fetch.
+
+`git lfs-x prune --boundary=<rev> --retain-days=<period>` prunes LFS
+objects as follows:
+
+ - It retains LFS objects for the current commit.
+ - It retains LFS objects for the tips of all local branches, assuming the
+   commit date of a tip is less than 40 years ago.
+ - It retains LFS objects for commits that are reachable from local branches
+   that have been retained in the previous step and whose commit date is less
+   than `--retain-days=<period>` ago.
+ - It retains LFS objects that have been added on any local branch by commmits
+   after `--boundary=<rev>`, that is the commits `<rev>..<tip>`, where `<tip>`
+   is a branch head.
+
+The boundary is maintained as a pseudo-remote branch
+`lfs-prune-boundary/master`, which is always updated even with `--dry-run`.
+`<rev>` must be HEAD or an ancestor of HEAD.  The command is equivalent to:
+
+```
+git update-ref refs/remotes/lfs-prune-boundary/master <rev>
+git -c lfs.fetchrecentremoterefs=false \
+    -c lfs.fetchrecentrefsdays=$(( 40 * 366 )) \
+    -c lfs.fetchrecentcommitsdays=<period> \
+    -c lfs.pruneoffsetdays=0 \
+    -c lfs.pruneremotetocheck=lfs-prune-boundary \
+    lfs prune --no-verify-remote
+```
+
+For example to prune LFS objects such that objects for any commit in the last
+200 days are retained:
+
+```
+git lfs-x prune --boundary=HEAD --retain-days=200
+```
+
+To get a detailed log what prune would do:
+
+```
+GIT_TRACE=1 git lfs-x prune --dry-run ...
+```
+
+"""
+
+from docopt import docopt
+from errno import ENOTEMPTY
+from glob import glob
+from itertools import zip_longest
+from os import lstat, chmod, walk, unlink, rmdir
+from os.path import isdir, exists, isfile
+from os.path import join as pjoin
+from subprocess import Popen, check_output, check_call, CalledProcessError
+from subprocess import STDOUT, PIPE
+import attr
+import hashlib
+import os
+import re
+import shutil
+import stat
+import sys
+
+
+semver = '0.1.0'
+
+pointerTemplate = """\
+version https://git-lfs.github.com/spec/v1
+oid sha256:{oid}
+size {size}
+"""
+
+
+class FsckError(Exception):
+    pass
+
+
+class GitError(Exception):
+    pass
+
+
+class LfsStoreError(Exception):
+    pass
+
+
+def main():
+    args = docopt(__doc__, version=semver)
+    if args['init']:
+        cmdInit(args)
+    elif args['checkout']:
+        cmdCheckout(args)
+    elif args['link']:
+        cmdLink(args)
+    elif args['fsck']:
+        cmdFsck(args)
+    elif args['gc']:
+        cmdGc(args)
+    elif args['add']:
+        cmdAdd(args)
+    elif args['migrate']:
+        cmdMigrate(args)
+    elif args['push']:
+        cmdPush(args)
+    elif args['fetch']:
+        cmdFetch(args)
+    elif args['prune']:
+        cmdPrune(args)
+
+
+def cmdInit(args):
+    lfs = gitPath('lfs')
+    if exists(pjoin(lfs, 'objects')):
+        return
+
+    try:
+        c = gitLine('config', 'core.sharedrepository')
+        isShared = (c == '1')
+    except CalledProcessError as err:
+        if err.returncode != 1:
+            raise
+        isShared = False
+
+    ensureDir(lfs, shared=isShared)
+    ensureDir(pjoin(lfs, 'objects'), shared=isShared)
+
+
+def cmdCheckout(args):
+    files = args['<files>']
+    lcp = 'link'
+    if args['--copy']:
+        lcp = 'copy'
+    if args['--link']:
+        lcp = 'link'
+    if args['--placeholder']:
+        lcp = 'placeholder'
+
+    if lcp == 'link':
+        cmd = ['git', 'lfs-x', 'link', '--'] + files
+        check_call(cmd)
+    elif lcp == 'copy':
+        mustCheckoutCopy(files)
+    elif lcp == 'placeholder':
+        mustCheckoutPlaceholders(files)
+    else:
+        raise RuntimeError('Logic error.')
+
+
+def mustCheckoutCopy(files):
+    for ent in lfsLsFiles(files):
+        if not exists(ent.path):
+            continue
+        if os.access(ent.path, os.W_OK):
+            continue
+        unlink(ent.path)
+    cmd = ['git', 'lfs', 'checkout', '--'] + files
+    check_call(cmd)
+
+
+def mustCheckoutPlaceholders(files):
+    for ent in lfsLsFiles(files):
+        if not exists(ent.path):
+            continue
+        unlink(ent.path)
+    cmd = [
+        'git',
+        '-c', 'filter.lfs.clean=git-lfs clean -- %f',
+        '-c', 'filter.lfs.smudge=',
+        '-c', 'filter.lfs.process=',
+        '-c', 'filter.lfs.required=false',
+        'checkout', '--',
+    ]
+    cmd += files
+    check_call(cmd)
+
+
+def cmdLink(args):
+    optKeepPlaceholders = args['--keep-placeholders']
+    optIgnoreMissing = args['--ignore-missing']
+
+    # Tell Git to ignore changes in hard link count.
+    gitConfigSet('core.trustctime', 'false')
+
+    executables = lsExecutables()
+    modified = []
+    store = LfsStore()
+    for ent in lfsLsFiles(files=args['<files>']):
+        if optKeepPlaceholders and ent.isPlaceholder():
+            log('Skipped placeholder: {}'.format(ent.path))
+            continue
+
+        if store.hasObject(ent.lfsid):
+            pass
+        elif store.tryLinkFromAlternates(ent.lfsid):
+            pass
+        elif optIgnoreMissing:
+            log('Ignored missing LFS object: {}'.format(ent.path))
+            continue
+        else:
+            die('Missing LFS object: {}'.format(ent.path))
+
+        if ent.path in executables:
+            if ent.isPlaceholder():
+                store.copyExecutable(ent)
+                modified.append(ent.path)
+                log('Copied executable: {}'.format(ent.path))
+            else:
+                log('Did not link executable: {}'.format(ent.path))
+            continue
+
+        if store.link(ent):
+            log('Linked: {}'.format(ent.path))
+            modified.append(ent.path)
+
+    if modified:
+        gitAssumeUnchangedOnce(modified)
+
+
+# `lfsLsFiles()` uses a filter list from `git ls-files` to limit listing.  `git
+# lfs ls-files` cannot be directly limited.  It always reports all full tree
+# paths.
+def lfsLsFiles(files=None):
+    prefixLen = len(gitLine('rev-parse', '--show-prefix'))
+    cmd = ['ls-files', '-z', '--full-name']
+    if files:
+        cmd += ['--'] + files
+    candidates = set(gitSplitlines0(*cmd))
+    for l in gitSplitlines('lfs', 'ls-files', '--long'):
+        lfsid, status, path = l.split(maxsplit=2)
+        if path in candidates:
+            yield Entry(lfsid, status, path[prefixLen:], fullpath=path)
+
+
+def lsExecutables(files=None):
+    cmd = ['ls-files', '-z', '--stage']
+    if files:
+        cmd += ['--'] + files
+    lines = gitSplitlines0(*cmd)
+    exes = set()
+    for l in lines:
+        mode, sha, stage, path = l.split(maxsplit=3)
+        if mode[3] == '7':
+            exes.add(path)
+    return exes
+
+
+@attr.s()
+class Entry(object):
+    lfsid = attr.ib()
+    status = attr.ib()
+    path = attr.ib()
+    fullpath = attr.ib()
+
+    def isContent(self):
+        return self.status == '*'
+
+    def isPlaceholder(self):
+        return self.status == '-'
+
+
+@attr.s()
+class LfsStore(object):
+    objDir = attr.ib(init=False)
+    isShared = attr.ib(init=False)
+    altObjDirs = attr.ib(init=False)
+    inodeMap = attr.ib(init=False)
+
+    def __attrs_post_init__(self):
+        self.objDir = gitPath('lfs/objects')
+
+        if not isdir(self.objDir):
+            raise LfsStoreError('Missing `lfs/objects` dir.')
+
+        try:
+            c = gitLine('config', 'core.sharedrepository')
+            self.isShared = (c == '1')
+        except CalledProcessError as err:
+            if err.returncode != 1:
+                raise
+            self.isShared = False
+
+        self.altObjDirs = findLfsAlternates()
+
+    def hasObject(self, lfsid):
+        return exists(self.lfsFilePath(lfsid))
+
+    def copyExecutable(self, ent):
+        src = self.lfsFilePath(ent.lfsid)
+        dst = ent.path
+        tmp = '{}.git-lfs-x-tmp'.format(dst)
+        shutil.copy(src, tmp)
+        os.chmod(tmp, 0o755)
+        os.rename(tmp, dst)
+
+    def link(self, ent):
+        src = self.lfsFilePath(ent.lfsid)
+        dst = ent.path
+        ensureReadOnlyFile(src)
+        return ensureHardLink(src, dst)
+
+    def linkToStore(self, src):
+        ensureReadOnlyFile(src)
+        lfsid = sha256HexPath(src)
+        odir = self.objDir
+        ensureDir(pjoin(odir, lfsid[0:2]), shared=self.isShared)
+        ensureDir(pjoin(odir, lfsid[0:2], lfsid[2:4]), shared=self.isShared)
+        dst = self.lfsFilePath(lfsid)
+        ensureHardLink(src, dst)
+        return lfsid
+
+    def lfsFilePath(self, lfsid):
+        return pjoin(self.objDir, lfsid[0:2], lfsid[2:4], lfsid)
+
+    def tryLinkFromAlternates(self, lfsid):
+        odir = self.objDir
+        ensureDir(pjoin(odir, lfsid[0:2]), shared=self.isShared)
+        ensureDir(pjoin(odir, lfsid[0:2], lfsid[2:4]), shared=self.isShared)
+        relpath = pjoin(lfsid[0:2], lfsid[2:4], lfsid)
+        dst = self.lfsFilePath(lfsid)
+        for a in self.altObjDirs:
+            src = pjoin(a, relpath)
+            if tryLink(src, dst):
+                log('Linked from alternate: {}'.format(src))
+                return True
+        return False
+
+    def buildInodeMap(self):
+        rgxOid = re.compile('^[0-9a-f]{64}$')
+        roots = [self.objDir] + self.altObjDirs
+        m = {}
+        for r in roots:
+            for parent, subs, files in walk(r):
+                for f in files:
+                    if not rgxOid.match(f):
+                        continue
+                    m[os.stat(pjoin(parent, f)).st_ino] = f
+        self.inodeMap = m
+
+    def findInode(self, path):
+        st = os.stat(path)
+        oid = self.inodeMap.get(st.st_ino)
+        if not oid:
+            return None
+        return LfsInode(oid=oid, size=st.st_size)
+
+
+@attr.s()
+class LfsInode(object):
+    oid = attr.ib()
+    size = attr.ib()
+
+
+
+def ensureDir(path, shared):
+    if isdir(path):
+        return
+    os.mkdir(path)
+    if shared:
+        os.chmod(path, 0o770 | stat.S_ISGID)
+
+
+def findLfsAlternates():
+    """`findLfsAlternates()` gathers candidate repos and then normalizes them
+    to point to the `lfs/objects`, ignoring paths that do not exists or are on
+    a different filesystem.
+    """
+    dev = os.stat(gitPath('lfs')).st_dev
+
+    alts = []
+    p = gitPath('objects/info/alternates')
+    if isfile(p):
+        with open(p, 'rb') as fp:
+            alts += fp.read().decode('utf-8').splitlines()
+
+    try:
+        alts += gitSplitlines0(
+            'config', '-z', '--get-all', 'lfs.weakalternate',
+        )
+    except CalledProcessError as err:
+        if err.returncode != 1:
+            raise
+
+    valid = []
+    for a in alts:
+        try:
+            p = gitPath('lfs/objects', cwd=a)
+        except FileNotFoundError:
+            continue  # Ignore repo does not exits.
+
+        if not os.path.isabs(p):
+            p = pjoin(a, p)
+
+        if not isdir(p):
+            continue  # Ignore repo has no `lfs/objects`.
+        if os.stat(p).st_dev != dev:
+            continue  # Ignore different filesystem.
+
+        valid.append(p)
+
+    return valid
+
+
+def ensureReadOnlyFile(path):
+    mode = lstat(path).st_mode
+    if not stat.S_ISREG(mode):
+        raise LfsStoreError('Not a regular file `{}`.'.format(path))
+
+    mode = stat.S_IMODE(mode)
+    noWriteMask = ~stat.S_IWUSR & ~stat.S_IWGRP & ~stat.S_IWOTH
+    if mode & noWriteMask == mode:
+        return
+
+    chmod(path, mode & noWriteMask)
+    log('Changed mode to read-only: {}'.format(path))
+
+
+def ensureHardLink(src, dst):
+    try:
+        if lstat(src).st_ino == lstat(dst).st_ino:
+            return False
+    except FileNotFoundError:
+        pass
+
+    tmp = '{}.git-lfs-x-tmp-lnk'.format(dst)
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    os.link(src, tmp)
+    os.rename(tmp, dst)
+    return True
+
+
+def tryLink(src, dst):
+    if not canLinkFrom(src):
+        return False
+    tmp = '{}.git-lfs-x-tmp-lnk'.format(dst)
+    try:
+        os.link(src, tmp)
+        os.rename(tmp, dst)
+    except OSError:
+        return False
+    return True
+
+
+# Link if:
+#
+# - Owned by the current user, since read-only can be ensured later.
+#
+# Do not link to another user's file if:
+#
+# - It is writable, because the current user cannot fix the permissions.
+# - It is not readable for the current user.
+#
+def canLinkFrom(src):
+    if not exists(src):
+        return False
+
+    s = lstat(src)
+    if s.st_uid == os.getuid():
+        return True
+
+    mode = stat.S_IMODE(s.st_mode)
+    writeMask = 0o222
+    if mode & writeMask != 0:
+        return False
+
+    return os.access(src, os.R_OK)
+
+
+def cmdFsck(args):
+    optFixPerms = args['--fix-perms']
+
+    gitdir = gitDir()
+    isShared = isSharedDir(gitdir)
+    if isShared:
+        log('Shared repo.')
+    else:
+        log('Normal repo.')
+
+    nErrs = 0
+    for parent, subs, files in walk(pjoin(gitdir, 'lfs')):
+        nErrs += fsckPath(parent, shared=isShared, fix=optFixPerms)
+
+        # Do not check individual files in `tmp` to avoid noise.  Git LFS
+        # constantly creates files there with unexpected permissions.  But we
+        # do not care about the individual file permissions as long as the dir
+        # permissions are correct.
+        if parent.endswith('/tmp'):
+            continue
+
+        for f in files:
+            nErrs += fsckPath(
+                pjoin(parent, f), shared=isShared, fix=optFixPerms,
+            )
+
+    if nErrs:
+        log('{} wrong permissions.'.format(nErrs))
+        exit(1)
+
+    log('All permissions ok.')
+
+
+# Files are always `a=r`, so that we can always use hard links.  Access control
+# via directory perms is considered sufficient.
+# `git-lfs-standalonetransfer-ssh` uses the same strategy.
+#
+# Directory permissions differ for shared and private repos.  The permissions
+# of the toplevel `.git` are used to determine whether a repo is shared, see
+# `isSharedDir()`.
+def fsckPath(path, shared, fix=False):
+    mode = lstat(path).st_mode
+    perms = stat.S_IMODE(mode)
+
+    if stat.S_ISREG(mode):
+        expected = 0o444  # a=r
+    elif stat.S_ISDIR(mode):
+        expected = perms
+        if shared:
+            expected |= 0o770  # ug+rwx.
+            expected |= stat.S_ISGID  # g+s
+        else:
+            expected |= 0o700  # u+rwx
+    else:
+        msg = 'Invalid file mode 0{:o}, cannot fix: {}'
+        log(msg.format(mode, path))
+        return 1
+
+    if perms == expected:
+        return 0
+
+    msg = 'Wrong perms, expected 0{:o} got 0{:o}: {}'
+    log(msg.format(expected, perms, path))
+    if not fix:
+        return 1
+
+    try:
+        chmod(path, expected)
+    except OSError:
+        logerr('Failed to fix perms.')
+        return 1
+
+    log('Fixed perms.')
+    return 0
+
+
+def isSharedDir(path):
+    mode = lstat(path).st_mode
+    if not stat.S_ISDIR(mode):
+        raise FsckError('Not a directory `{}`.'.format(path))
+    return mode & stat.S_ISGID != 0
+
+
+def cmdGc(args):
+    tmpdir = gitPath('lfs/tmp')
+    for parent, subs, files in walk(tmpdir):
+        for f in files:
+            try:
+                unlink(pjoin(parent, f))
+            except:
+                # Silently ignore errors.  Either the problem is meaningless,
+                # or it will resurface during a real operation.
+                pass
+
+
+def cmdAdd(args):
+    files = args['<files>']
+
+    lst = [e.path for e in lfsLsFiles(files)] + gitLsOtherFiles(files)
+    if len(lst) == 0:
+        log('Nothing to add.')
+        exit(0)
+
+    err = None
+    for path, val in gitCheckAttr(lst, attr='filter'):
+        if val != 'lfs':
+            logerr('Missing filter=lfs attribute for path `{}`.'.format(path))
+            err = True
+    if err:
+        die("Refusing to add.")
+
+    # Try to locate inodes in alternates.  If an inode is found, link it and
+    # update the index directly, so that Git does not ask LFS to compute the
+    # SHA again.
+
+    # Tell Git to ignore changes in hard link count.
+    gitConfigSet('core.trustctime', 'false')
+
+    store = LfsStore()
+    store.buildInodeMap()
+
+    add = []
+    updateIndex = []
+    assumeUnchanged = []
+
+    prefix = gitLine('rev-parse', '--show-prefix')
+    def addPointer(src, oid, size):
+        pointer = pointerTemplate.format(oid=oid, size=size)
+        cmd = [
+            'git', 'hash-object', '-w',
+            '-t', 'blob',
+            '--stdin', '--no-filters',
+        ]
+        out = check_output(cmd, input=pointer.encode('utf-8'))
+        blob = out.decode('utf-8').strip()
+
+        # `100644` is always the right mode.  Inodes from the inode map must be
+        # in an LFS store, where all files are non-executable, and `--link`
+        # only add files that are non-executable.
+        updateIndex.append('100644 blob {}\t{}{}'.format(blob, prefix, src))
+        assumeUnchanged.append(src)
+
+    for p in lst:
+        ino = store.findInode(p)
+        if not ino:
+            add.append(p)
+            continue
+
+        if not store.hasObject(ino.oid):
+            if not store.tryLinkFromAlternates(ino.oid):
+                add.append(p)
+                continue
+
+        addPointer(p, oid=ino.oid, size=ino.size)
+
+    # If hard links are requested, link non-executable files to avoid
+    # unnecessary copies.
+    if args['--link']:
+        addCp = []
+        for p in add:
+            st = os.lstat(p)
+            if not isRegularNonExecutable(st.st_mode):
+                addCp.append(p)
+                continue
+            oid = store.linkToStore(p)
+            addPointer(p, oid=oid, size=st.st_size)
+        add = addCp
+
+    if updateIndex:
+        cmd = ['git', 'update-index', '-z', '--index-info']
+        in0 = '\x00'.join(updateIndex) + '\x00'
+        check_output(cmd, input=in0.encode('utf-8'))
+        gitAssumeUnchangedOnce(assumeUnchanged)
+
+    if len(add) == 0:
+        exit(0)
+
+    check_call(['git', 'add', '--'] + add)
+
+
+def isRegularNonExecutable(mode):
+    maskAnyX = (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return stat.S_ISREG(mode) and (mode & maskAnyX == 0)
+
+
+def sha256HexPath(path):
+    BLOCKSIZE = 8 * 1024
+    h = hashlib.sha256()
+    with open(path, 'rb') as fp:
+        while True:
+            buf = fp.read(BLOCKSIZE)
+            if len(buf) == 0:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
+def cmdMigrate(args):
+    if gitLine('rev-parse', '--show-prefix') != '':
+        die('Must be run in toplevel of the working copy.')
+
+    dirty = gitStatus()
+    if dirty:
+        die('Uncommitted changes; commit everything before you continue.')
+
+    err = False
+    for p in gitSplitlines0('ls-files', '-z'):
+        if p.endswith('/.gitattributes'):
+            logerr('Subdir attributes `{}`.'.format(p))
+            err = True
+    if err:
+        die('`.gitattributes` in subfolders are not supported.')
+
+    if not exists('.gitattributes'):
+        die('No `.gitattributes`.')
+
+    if hasGitSiloPlaceholder():
+        die("""\
+Found silo placeholders.  Fetch all Silo content before converting to LFS:
+
+    git silo fetch -- .
+    git silo status
+""")
+
+    attrs = readFile('.gitattributes')
+    lfsattrs = attrs.replace("filter=silo", "filter=lfs diff=lfs merge=lfs")
+    if lfsattrs == attrs:
+        die('Nothing to migrate.')
+
+    with open('.gitattributes', 'wb') as fp:
+        fp.write(lfsattrs.encode('utf-8'))
+
+    unlink(gitPath('index'))
+    check_call(['git', 'add', '.'])
+    try:
+        check_call(['git', 'commit', '-m', 'Migrate to LFS'])
+    except CalledProcessError as err:
+        die(str(err))
+
+
+def cmdPush(args):
+    optHeadAll = args['--head-all']
+    optSkipPlaceholders = args['--skip-placeholders']
+    remote = args['<remote>']
+
+    if not optHeadAll:
+        raise RuntimeError('Logic error.')
+
+    os.chdir(gitLine('rev-parse', '--show-toplevel'))
+
+    if optSkipPlaceholders:
+        oids = [ent.lfsid for ent in lfsLsFiles() if ent.isContent()]
+    else:
+        oids = [ent.lfsid for ent in lfsLsFiles()]
+
+    if len(oids) == 0:
+        print('Nothing to push.')
+        exit(0)
+
+    cmd = ['xargs', '-0', 'git', 'lfs', 'push', '--object-id', remote]
+    oids0 = '\x00'.join(oids) + '\x00'
+    Popen(cmd, stdin=PIPE).communicate(input=oids0.encode('utf-8'))
+
+
+def chunks(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+
+
+def cmdFetch(args):
+    files = args['<files>']
+
+    # Restrict `git lfs fetch` to paths with a leading slash, because
+    # git-lfs-2.7.0 incorrectly ignores some unrooted paths.  Using a rooted
+    # path is precisely what we want anyway, because we know that the path
+    # starts at the root tree.
+    #
+    # We have not analyzed the root cause.  Possible starting points for a more
+    # thorough analysis:
+    #
+    #  - The problem probably exists since 2.4.0: 2.3.4 is the last version
+    #    known to work; 2.4.2 is the first version known to have the problem.
+    #  - The problem depends on the path. Stdrepo `fuimages_neurotracking_2016`
+    #    path `results/filopodia_2015-12/results/filopodia_isosurface.png` has
+    #    the problem.
+    #  - The output of `GIT_TRACE=1 git lfs fetch -- -I<path>`.
+    #  - Git LFS source `filepathfilter/filepathfilter.go` and its history.
+    #
+    paths = [ent.fullpath for ent in lfsLsFiles(files)]
+    max_num_paths = 2000
+    for chunk in chunks(paths, max_num_paths):
+        rooted = (('/' + c) for c in chunk)
+        cmd = ['git', 'lfs', 'fetch', '-I', ','.join(rooted)]
+        check_call(cmd)
+
+    cmd = ['git', 'lfs-x', 'checkout']
+    if args['--link']:
+        cmd.append('--link')
+    if args['--copy']:
+        cmd.append('--copy')
+    cmd.append('--')
+    cmd += files
+    check_call(cmd)
+
+
+def cmdPrune(args):
+    rev = args['--boundary']
+    boundary = gitLine('rev-parse', rev)
+    if not isHeadOrAncestor(boundary):
+        die('--boundary must be HEAD or an ancestor of HEAD.')
+
+    period = args['--retain-days']
+    try:
+        period = int(period)
+    except ValueError:
+        die('--retain-days must be an integer.')
+    if period < 1:
+        die('--retain-days must be a positive integer.')
+
+    cmd = ['git', 'update-ref', 'refs/remotes/lfs-prune-boundary/master', rev]
+    check_call(cmd)
+
+    cmd = [
+        'git',
+        '-c', 'lfs.fetchrecentremoterefs=false',
+        '-c', 'lfs.fetchrecentrefsdays={}'.format(40 * 366),
+        '-c', 'lfs.fetchrecentcommitsdays={}'.format(period),
+        '-c', 'lfs.pruneoffsetdays=0',
+        '-c', 'lfs.pruneremotetocheck=lfs-prune-boundary',
+        'lfs', 'prune', '--no-verify-remote',
+    ]
+    if args['-v']:
+        cmd.append('--verbose')
+    if args['--dry-run']:
+        cmd.append('--dry-run')
+    check_call(cmd)
+
+    removeEmptyObjectDirs()
+
+
+# `removeEmptyObjectDirs()` removes empty object subdirectories.  It continues
+# on errors, removing as many directories as possible, finally raising the
+# first error.
+def removeEmptyObjectDirs():
+    n = 0
+    nErr = 0
+    err = None
+    objects = gitPath('lfs/objects')
+    subPat = '[0-9a-f][0-9a-f]'
+    for d in (
+        glob(pjoin(objects, subPat, subPat)) +
+        glob(pjoin(objects, subPat))
+    ):
+        try:
+            rmdir(d)
+            n += 1
+        except OSError as e:
+            if e.errno == ENOTEMPTY:
+                continue
+            nErr += 1
+            if err is None:
+                err = e
+
+    dirs = 'directory' if n == 1 else 'directories'
+    if nErr > 0:
+        msg = 'Removed {} empty object {}; failed to remove {}.'
+        logerr(msg.format(n, dirs, nErr))
+        raise err
+    if n > 0:
+        log('Removed {} empty object {}.'.format(n, dirs))
+
+
+
+def isHeadOrAncestor(rev):
+    toRev = gitLine('rev-list', '-n1', 'HEAD..{}'.format(rev))
+    return toRev == ''
+
+
+def hasGitSiloPlaceholder():
+    for l in gitSplitlines('silo', 'status'):
+        if l.startswith('placeholder'):
+            return True
+    return False
+
+
+def readFile(file):
+    with open(file, 'rb') as f:
+        content = f.read().decode('utf-8')
+    return content
+
+
+def gitCheckAttr(paths, attr):
+    if len(paths) == 0:
+        return []
+
+    cmd = ['git', 'check-attr', '--stdin', '-z', attr]
+    path0 = '\x00'.join(paths) + '\x00'
+    out = check_output(cmd, input=path0.encode('utf-8'))
+    out = out.decode('utf-8').rstrip('\x00').split('\x00')
+    for path, _, val in grouper(out, 3):
+        yield (path, val)
+
+
+# <https://docs.python.org/3/library/itertools.html>
+def grouper(iterable, n, fillvalue=None):
+    args = [iter(iterable)] * n
+    return zip_longest(*args, fillvalue=fillvalue)
+
+
+def gitLsOtherFiles(files):
+    return gitSplitlines0(
+        'ls-files', '--exclude-standard', '--exclude=.git*', '--other', '-z',
+        '--', *files
+    )
+
+
+def gitSplitlines(*args):
+    out = check_output(['git'] + list(args))
+    if out == b'':
+        return []
+    return out.decode('utf-8').splitlines()
+
+
+def gitSplitlines0(*args):
+    out = check_output(['git'] + list(args))
+    if out == b'':
+        return []
+    return out.decode('utf-8').rstrip('\x00').split('\x00')
+
+
+def gitLine(*args):
+    return check_output(['git'] + list(args)).decode('utf-8').strip()
+
+
+def gitStatus():
+    return gitSplitlines0('status', '-z', '--porcelain')
+
+
+def gitConfigSet(*args):
+    check_call(['git', 'config'] + list(args))
+
+
+def gitDir():
+    return check_output([
+        'git', 'rev-parse', '--git-dir',
+    ]).decode('utf-8').strip()
+
+
+def gitPath(path, cwd=None):
+    return check_output([
+        'git', 'rev-parse', '--git-path', path,
+    ], cwd=cwd).decode('utf-8').strip()
+
+
+# `--assume-unchanged-once` can be used to skip re-computing the SHA for a hard
+# link that is known to have the correct content.  See patch in
+# <https://github.com/sprohaska/git-silo/tree/master/git>.
+def detectGitHasAssumeUnchangedOnce():
+    try:
+        h = check_output(['git', 'update-index', '-h'], stderr=STDOUT)
+    except CalledProcessError as err:
+        if err.returncode != 129:
+            raise
+        h = err.output
+    return b'--assume-unchanged-once' in h
+
+
+if detectGitHasAssumeUnchangedOnce():
+    def gitAssumeUnchangedOnce(paths):
+        cmd = [
+            'git', 'update-index', '--assume-unchanged-once', '-z', '--stdin',
+        ]
+        paths0 = '\x00'.join(paths) + '\x00'
+        Popen(cmd, stdin=PIPE).communicate(input=paths0.encode('utf-8'))
+else:
+    def gitAssumeUnchangedOnce(paths):
+        logwarn(
+            'No `git update-index --assume-unchanged-once`, '
+            'using `git add` instead.'
+        )
+        cmd = ['xargs', '-0', 'git', 'add', '--']
+        paths0 = '\x00'.join(paths) + '\x00'
+        Popen(cmd, stdin=PIPE).communicate(input=paths0.encode('utf-8'))
+
+
+def log(msg):
+    print('lfs-x:', msg)
+
+
+def logwarn(msg):
+    print('lfs-x: warning:', msg)
+
+
+def logerr(msg):
+    print('lfs-x: error:', msg)
+
+
+def die(msg):
+    sys.exit('lfs-x: fatal: {}'.format(msg))
+
+
+main()
